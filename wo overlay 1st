@@ -1,0 +1,585 @@
+use bitcoin::{Block, Transaction, OutPoint};
+use bitcoin_rpc_client::BitcoinCoreClient;
+use ordinals::{Inscription, SatPoint};
+use rusqlite::{Connection, params};
+use libp2p::{Swarm, identity, PeerId, Multiaddr};
+use libp2p::gossipsub::{Gossipsub, IdentTopic};
+use libp2p::kad::Kademlia;
+use serde::{Deserialize, Serialize};
+use serde_cbor::Value as CborValue;
+use regex::Regex;
+use std::collections::{HashMap, VecDeque};
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use log::{info, warn, error};
+use config::Config as ConfigLoader;
+use rayon::prelude::*;
+use num_cpus;
+use std::time::Duration;
+
+// Configuration struct for config.toml
+#[derive(Debug, Deserialize, Serialize)]
+struct BitmapConfig {
+    network: String,          // "mainnet" or "testnet"
+    cache_blocks: usize,     // Default: 144
+    validate_sat: bool,      // Optional UTXO validation
+    parallelism_enabled: bool, // Parallel processing
+    batch_size: usize,       // SQLite batch size
+    bns_history_mode: String, // "prune" or "full" for BNS history
+    bootstrap_nodes: Vec<String>, // Placeholder for DNS seed list
+    bitcoin_rpc_url: String, // Bitcoin Core RPC URL
+    bitcoin_rpc_user: String,
+    bitcoin_rpc_pass: String,
+}
+
+// Bitmap registry entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BitmapEntry {
+    blockheight: String,     // e.g., "123" (District), "0.123" (Parcel)
+    timestamp: u64,          // Block header timestamp
+    inscription_id: String,  // Ordinals inscription ID
+    satpoint: String,       // Serialized SatPoint
+    current_owner: String,   // Wallet address
+    transfer_block: u64,     // Block height of last transfer
+}
+
+// BNS registry entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BnsEntry {
+    name: String,            // e.g., "123.bitmap", "0.123.bitmap", "alice.bitmap"
+    address: String,         // Bitmap block height (e.g., "123", "0.123")
+    owner: String,           // Bitcoin address
+    inscription_block: u64,  // Block height of inscription
+    tx_index: u32,           // Transaction index in block
+    inscription_id: String,  // Ordinals inscription ID
+    sat_number: u64,         // Satoshi ordinal
+    transfer_status: bool,   // True if transfer in progress
+    transfer_block: u64,     // Block height of transfer initiation
+    timestamp: u64,          // Unix timestamp from block
+    is_default_name: bool,   // True if <blockheight>.bitmap or <parcel>.<blockheight>.bitmap
+    original_blockheight: String, // Explicit Bitmap block height
+}
+
+// libp2p message types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum BitmapMessage {
+    BitmapRegistration(BitmapEntry),
+    BitmapTransfer(BitmapEntry),
+    BnsInscription(BnsEntry),
+    TimestampRequest { inscription_id: String },
+    TimestampResponse { inscription_id: String, timestamp: u64 },
+}
+
+// Cache for recent 144 blocks
+struct BitmapCache {
+    bns_entries: VecDeque<(u64, BnsEntry)>, // (block_height, BNS entry)
+    bitmap_entries: HashMap<String, BitmapEntry>, // inscription_id -> BitmapEntry
+    max_size: usize,       // 144 blocks
+}
+
+impl BitmapCache {
+    fn new(max_size: usize) -> Self {
+        BitmapCache {
+            bns_entries: VecDeque::new(),
+            bitmap_entries: HashMap::new(),
+            max_size,
+        }
+    }
+
+    fn update_bns(&mut self, entry: &BnsEntry, block_height: u64) {
+        self.bns_entries.push_back((block_height, entry.clone()));
+        while self.bns_entries.len() > self.max_size {
+            self.bns_entries.pop_front();
+        }
+    }
+
+    fn update_bitmap(&mut self, entry: &BitmapEntry) {
+        self.bitmap_entries.insert(entry.inscription_id.clone(), entry.clone());
+    }
+
+    fn check_cooldown(&self, blockheight: &str, current_block: u64) -> bool {
+        for (_, entry) in &self.bns_entries {
+            if entry.address == blockheight && current_block - entry.transfer_block < 144 {
+                return false; // Cooldown violation for BNS
+            }
+        }
+        for (_, entry) in &self.bitmap_entries {
+            if entry.blockheight == blockheight && current_block - entry.transfer_block < 144 {
+                return false; // Cooldown violation for Bitmap
+            }
+        }
+        true
+    }
+
+    fn get_bitmap(&self, inscription_id: &str) -> Option<&BitmapEntry> {
+        self.bitmap_entries.get(inscription_id)
+    }
+}
+
+// Load configuration from config.toml
+fn load_config(file: &str) -> BitmapConfig {
+    ConfigLoader::builder()
+        .add_source(config::File::with_name(file))
+        .set_default("cache_blocks", 144).unwrap()
+        .set_default("validate_sat", false).unwrap()
+        .set_default("parallelism_enabled", true).unwrap()
+        .set_default("batch_size", 100).unwrap()
+        .set_default("bns_history_mode", "prune").unwrap()
+        .set_default("bootstrap_nodes", vec![] as Vec<String>).unwrap()
+        .build()
+        .expect("Failed to load config")
+        .try_deserialize::<BitmapConfig>()
+        .expect("Failed to deserialize config")
+}
+
+// Initialize SQLite database
+fn init_database(db_path: &str) -> Connection {
+    let conn = Connection::open(db_path).expect("Failed to open database");
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS bitmap_registry (
+            blockheight TEXT PRIMARY KEY,
+            timestamp INTEGER NOT NULL,
+            inscription_id TEXT NOT NULL,
+            satpoint TEXT NOT NULL,
+            current_owner TEXT NOT NULL,
+            transfer_block INTEGER NOT NULL
+        )",
+        [],
+    ).expect("Failed to create bitmap_registry");
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS bitmap_bns_registry (
+            name TEXT PRIMARY KEY,
+            address TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            inscription_block INTEGER NOT NULL,
+            tx_index INTEGER NOT NULL,
+            inscription_id TEXT NOT NULL,
+            sat_number INTEGER NOT NULL,
+            transfer_status INTEGER NOT NULL,
+            transfer_block INTEGER NOT NULL,
+            timestamp INTEGER NOT NULL,
+            is_default_name INTEGER NOT NULL,
+            original_blockheight TEXT NOT NULL,
+            previous_owner TEXT,
+            previous_inscription_id TEXT,
+            previous_sat_number INTEGER
+        )",
+        [],
+    ).expect("Failed to create bitmap_bns_registry");
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS bitmap_bns_history (
+            name TEXT NOT NULL,
+            address TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            inscription_block INTEGER NOT NULL,
+            tx_index INTEGER NOT NULL,
+            inscription_id TEXT NOT NULL,
+            sat_number INTEGER NOT NULL,
+            transfer_status INTEGER NOT NULL,
+            transfer_block INTEGER NOT NULL,
+            timestamp INTEGER NOT NULL,
+            is_default_name INTEGER NOT NULL,
+            original_blockheight TEXT NOT NULL
+        )",
+        [],
+    ).expect("Failed to create bitmap_bns_history");
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS bitmap_pending_review (
+            inscription_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            address TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            inscription_block INTEGER NOT NULL,
+            tx_index INTEGER NOT NULL,
+            sat_number INTEGER NOT NULL,
+            reason TEXT NOT NULL
+        )",
+        [],
+    ).expect("Failed to create bitmap_pending_review");
+    conn
+}
+
+// Initialize Bitcoin Core RPC client
+fn init_bitcoin_rpc(config: &BitmapConfig) -> BitcoinCoreClient {
+    BitcoinCoreClient::new(
+        &config.bitcoin_rpc_url,
+        Some(&config.bitcoin_rpc_user),
+        Some(&config.bitcoin_rpc_pass),
+    ).expect("Failed to initialize Bitcoin Core RPC")
+}
+
+// Build Bitmap index
+fn build_bitmap_index(
+    conn: &Connection,
+    rpc: &BitcoinCoreClient,
+    cache: &mut BitmapCache,
+    start_block: u64,
+) {
+    let current_height = rpc.get_block_count().unwrap_or(start_block);
+    for height in start_block..=current_height {
+        let block_hash = rpc.get_block_hash(height).unwrap();
+        let block = rpc.get_block(&block_hash).unwrap();
+        process_block_for_bitmaps(conn, rpc, cache, &block, height);
+    }
+}
+
+// Process block for Bitmap inscriptions
+fn process_block_for_bitmaps(
+    conn: &Connection,
+    _rpc: &BitcoinCoreClient,
+    cache: &mut BitmapCache,
+    block: &Block,
+    block_height: u64,
+) {
+    let timestamp = block.header.time as u64;
+    for (tx_index, tx) in block.txdata.iter().enumerate() {
+        let inscriptions = ordinals::parse_inscriptions(tx).unwrap_or_default();
+        for inscription in inscriptions {
+            if inscription.content.ends_with(".bitmap") && inscription.cbor.is_empty() {
+                // Parse <blockheight>.bitmap or <parcel>.<blockheight>.bitmap
+                let parts: Vec<&str> = inscription.content.split('.').collect();
+                if parts.len() < 2 || parts.last() != Some(&"bitmap") {
+                    continue; // Invalid format
+                }
+                let target_blockheight = if parts.len() == 3 {
+                    // Parcel: <parcel>.<blockheight>.bitmap (e.g., 0.123.bitmap -> 0.123)
+                    format!("{}.{}", parts[0], parts[1])
+                } else {
+                    // District: <blockheight>.bitmap (e.g., 123.bitmap -> 123)
+                    parts[0].to_string()
+                };
+                let expected_content = format!("{}.bitmap", target_blockheight);
+
+                // Skip if content doesn't match expected format
+                if inscription.content != expected_content {
+                    continue;
+                }
+
+                // Check if already registered
+                let existing = conn.query_row(
+                    "SELECT inscription_id FROM bitmap_registry WHERE blockheight = ?",
+                    params![target_blockheight],
+                    |row| row.get::<_, String>(0),
+                ).ok();
+
+                if existing.is_some() {
+                    continue; // Drop if already claimed
+                }
+
+                // Validate Bitmap rules: FiF, block timing
+                let blockheight_num = parts[if parts.len() == 3 { 1 } else { 0 }]
+                    .parse::<u64>()
+                    .unwrap_or(0);
+                if block_height >= blockheight_num {
+                    let entry = BitmapEntry {
+                        blockheight: target_blockheight.clone(),
+                        timestamp,
+                        inscription_id: inscription.id.clone(),
+                        satpoint: serde_json::to_string(&inscription.sat_point).unwrap(),
+                        current_owner: inscription.owner.clone(),
+                        transfer_block: block_height,
+                    };
+                    store_bitmap_entry(conn, &entry);
+                    cache.update_bitmap(&entry);
+                    // Broadcast new Bitmap registration
+                    broadcast_message(&mut swarm, &BitmapMessage::BitmapRegistration(entry.clone()));
+                }
+            }
+        }
+    }
+}
+
+// Validate BNS inscription
+fn validate_bns_inscription(
+    inscription: &Inscription,
+    block: &Block,
+    tx_index: u32,
+    config: &BitmapConfig,
+    cache: &BitmapCache,
+    conn: &Connection,
+    rpc: &BitcoinCoreClient,
+) -> Result<BnsEntry, String> {
+    // Skip non-`.bitmap` inscriptions
+    if !inscription.content.ends_with(".bitmap") {
+        return Err("non-`.bitmap` name".to_string());
+    }
+
+    // Check CBOR size <= 5KB
+    if inscription.cbor.len() > 5_000 {
+        return Err("CBOR size exceeded".to_string());
+    }
+
+    // Parse CBOR metadata
+    let metadata: HashMap<String, CborValue> = serde_cbor::from_slice(&inscription.cbor)
+        .map_err(|_| "invalid CBOR".to_string())?;
+    if !metadata.get("BNS").map(|v| v.is_boolean() && v.as_bool().unwrap()).unwrap_or(false) {
+        return Err("missing or invalid BNS flag".to_string());
+    }
+    let transfer = metadata.get("transfer").ok_or("missing transfer field".to_string())?;
+    let transfer_data = transfer.as_array().ok_or("invalid transfer format".to_string())?;
+    let transfer_status = transfer_data[0].as_bool().ok_or("invalid transfer status".to_string())?;
+    let transfer_name = if transfer_status {
+        transfer_data[1].as_str().ok_or("invalid transfer name".to_string())?.to_string()
+    } else {
+        String::new()
+    };
+
+    // Validate name format
+    let name_regex = Regex::new(r"^[0-9]+(\.[0-9]+)?\.bitmap$|^[a-zA-Z0-9]+\.bitmap$").unwrap();
+    if !name_regex.is_match(&inscription.content) {
+        return Err("invalid name format".to_string());
+    }
+
+    // Extract address (Bitmap block height)
+    let address = if inscription.content.chars().next().unwrap().is_numeric() {
+        let parts: Vec<&str> = inscription.content.split('.').collect();
+        if parts.len() == 3 {
+            // Parcel: <parcel>.<blockheight>.bitmap (e.g., 0.123.bitmap -> 0.123)
+            format!("{}.{}", parts[0], parts[1])
+        } else {
+            // District: <blockheight>.bitmap (e.g., 123.bitmap -> 123)
+            parts[0].to_string()
+        }
+    } else {
+        // Alphanumeric: Query Bitmap registry
+        conn.query_row(
+            "SELECT blockheight FROM bitmap_registry WHERE satpoint = ?",
+            params![serde_json::to_string(&inscription.sat_point).unwrap()],
+            |row| row.get::<_, String>(0),
+        ).map_err(|_| "Bitmap not found".to_string())?
+    };
+
+    // Numeric name must match address
+    if inscription.content.chars().next().unwrap().is_numeric() {
+        let expected_name = format!("{}.bitmap", address);
+        if inscription.content != expected_name {
+            return Err("numeric name mismatch".to_string());
+        }
+    }
+
+    // Validate satoshi ownership
+    let bitmap = conn.query_row(
+        "SELECT blockheight, current_owner FROM bitmap_registry WHERE satpoint = ?",
+        params![serde_json::to_string(&inscription.sat_point).unwrap()],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    ).map_err(|_| "invalid Bitmap satoshi".to_string())?;
+    if bitmap.0 != address {
+        return Err("Bitmap block height mismatch".to_string());
+    }
+
+    // Check 144-block cooldown
+    if !cache.check_cooldown(&address, block.header.time as u64) {
+        return Err("cooldown violation".to_string());
+    }
+
+    // Validate timestamp
+    let timestamp = block.header.time as u64;
+    if timestamp != inscription.timestamp {
+        return Err("timestamp mismatch".to_string());
+    }
+
+    // Optional sat number validation
+    if config.validate_sat {
+        let txout = rpc.get_tx_out(&inscription.sat_point.outpoint).unwrap();
+        if txout.is_none() {
+            return Err("invalid sat number".to_string());
+        }
+    }
+
+    Ok(BnsEntry {
+        name: inscription.content.clone(),
+        address,
+        owner: inscription.owner.clone(),
+        inscription_block: block.header.time as u64,
+        tx_index,
+        inscription_id: inscription.id.clone(),
+        sat_number: inscription.sat_number,
+        transfer_status,
+        transfer_block: if transfer_status { block.header.time as u64 } else { 0 },
+        timestamp,
+        is_default_name: inscription.content == format!("{}.bitmap", address),
+        original_blockheight: bitmap.0,
+    })
+}
+
+// Store Bitmap entry
+fn store_bitmap_entry(conn: &Connection, entry: &BitmapEntry) {
+    conn.execute(
+        "INSERT OR REPLACE INTO bitmap_registry (blockheight, timestamp, inscription_id, satpoint, current_owner, transfer_block)
+         VALUES (?, ?, ?, ?, ?, ?)",
+        params![entry.blockheight, entry.timestamp, entry.inscription_id, entry.satpoint, entry.current_owner, entry.transfer_block],
+    ).expect("Failed to insert Bitmap entry");
+}
+
+// Store BNS entry
+fn store_bns_entry(conn: &Connection, entry: &BnsEntry, bns_history_mode: &str) {
+    let tx = conn.transaction().expect("Failed to start transaction");
+    tx.execute(
+        "INSERT OR REPLACE INTO bitmap_bns_registry (
+            name, address, owner, inscription_block, tx_index, inscription_id,
+            sat_number, transfer_status, transfer_block, timestamp, is_default_name,
+            original_blockheight, previous_owner, previous_inscription_id, previous_sat_number
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (
+            SELECT owner FROM bitmap_bns_registry WHERE name = ?
+        ), (
+            SELECT inscription_id FROM bitmap_bns_registry WHERE name = ?
+        ), (
+            SELECT sat_number FROM bitmap_bns_registry WHERE name = ?
+        ))",
+        params![
+            entry.name, entry.address, entry.owner,
+            entry.inscription_block, entry.tx_index, entry.inscription_id,
+            entry.sat_number, entry.transfer_status, entry.transfer_block,
+            entry.timestamp, entry.is_default_name, entry.original_blockheight,
+            entry.name, entry.name, entry.name
+        ],
+    ).expect("Failed to insert into bitmap_bns_registry");
+
+    if bns_history_mode == "full" {
+        tx.execute(
+            "INSERT INTO bitmap_bns_history (
+                name, address, owner, inscription_block, tx_index, inscription_id,
+                sat_number, transfer_status, transfer_block, timestamp, is_default_name,
+                original_blockheight
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                entry.name, entry.address, entry.owner,
+                entry.inscription_block, entry.tx_index, entry.inscription_id,
+                entry.sat_number, entry.transfer_status, entry.transfer_block,
+                entry.timestamp, entry.is_default_name, entry.original_blockheight
+            ],
+        ).expect("Failed to insert into bitmap_bns_history");
+    }
+    tx.commit().expect("Failed to commit transaction");
+}
+
+// Flag invalid inscription for review
+fn flag_for_review(conn: &Connection, inscription: &Inscription, reason: &str, block: &Block, tx_index: u32) {
+    conn.execute(
+        "INSERT OR REPLACE INTO bitmap_pending_review (
+            inscription_id, name, address, owner, inscription_block, tx_index, sat_number, reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            inscription.id, inscription.content, "", inscription.owner,
+            block.header.time as u64, tx_index, inscription.sat_number, reason
+        ],
+    ).expect("Failed to flag for review");
+}
+
+// Setup libp2p swarm
+fn setup_libp2p(config: &BitmapConfig) -> Swarm<(Gossipsub, Kademlia<PeerId>)> {
+    let local_key = identity::Keypair::generate_ed25519();
+    let local_peer_id = PeerId::from(local_key.public());
+    let transport = libp2p::tcp::TokioTcpConfig::new().nodelay(true);
+    let gossipsub = Gossipsub::new(local_peer_id, Default::default()).unwrap();
+    let kademlia = Kademlia::new(local_peer_id, Default::default());
+    let mut swarm = Swarm::new(transport, (gossipsub, kademlia), local_peer_id);
+    let topic = IdentTopic::new(if config.network == "mainnet" {
+        "bitmap-inscriptions"
+    } else {
+        "bitmap-inscriptions-testnet"
+    });
+    swarm.behaviour_mut().0.subscribe(&topic).unwrap();
+    for addr in &config.bootstrap_nodes {
+        if let Ok(multiaddr) = addr.parse::<Multiaddr>() {
+            swarm.dial(multiaddr).unwrap();
+        }
+    }
+    swarm
+}
+
+// Broadcast message to peers
+fn broadcast_message(swarm: &mut Swarm<(Gossipsub, Kademlia<PeerId>)>, message: &BitmapMessage) {
+    let topic = IdentTopic::new("bitmap-inscriptions");
+    let payload = serde_json::to_vec(message).unwrap();
+    swarm.behaviour_mut().0.publish(topic, payload).unwrap();
+}
+
+// Resolve timestamp mismatches
+fn resolve_timestamp_mismatch(
+    swarm: &mut Swarm<(Gossipsub, Kademlia<PeerId>)>,
+    inscription_id: &str,
+) -> Option<u64> {
+    let request = BitmapMessage::TimestampRequest {
+        inscription_id: inscription_id.to_string(),
+    };
+    broadcast_message(swarm, &request);
+    // Placeholder: Collect responses from all peers
+    None // Return majority timestamp or None
+}
+
+// Main execution loop
+fn main() {
+    env_logger::init();
+    let config = load_config("config.toml");
+    info!("Starting Bitmap node in {} mode", config.network);
+
+    let db_path = if config.network == "mainnet" {
+        "bitmap_mainnet.db"
+    } else {
+        "bitmap_testnet.db"
+    };
+    let conn = init_database(db_path);
+    let rpc = init_bitcoin_rpc(&config);
+    let mut swarm = setup_libp2p(&config);
+    let mut cache = BitmapCache::new(config.cache_blocks);
+
+    let start_block = 792435; // First Bitmap block
+    build_bitmap_index(&conn, &rpc, &mut cache, start_block);
+
+    let mut current_block_height = rpc.get_block_count().unwrap_or(start_block);
+
+    loop {
+        let block_hash = rpc.get_block_hash(current_block_height).unwrap();
+        let block = rpc.get_block(&block_hash).unwrap();
+
+        // Process Bitmap inscriptions
+        process_block_for_bitmaps(&conn, &rpc, &mut cache, &block, current_block_height);
+
+        // Process BNS inscriptions
+        let inscriptions: Vec<(Inscription, u32)> = block.txdata.iter().enumerate()
+            .par_iter()
+            .filter(|_| config.parallelism_enabled)
+            .flat_map(|(i, tx)| {
+                ordinals::parse_inscriptions(tx).unwrap_or_default()
+                    .into_iter()
+                    .map(|ins| (ins, *i as u32))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        let batch_size = config.batch_size;
+        inscriptions.chunks(batch_size).for_each(|chunk| {
+            let tx = conn.transaction().unwrap();
+            for (inscription, tx_index) in chunk {
+                if inscription.cbor.is_empty() && inscription.content.ends_with(".bitmap") {
+                    // Handled by process_block_for_bitmaps
+                    continue;
+                }
+                match validate_bns_inscription(&inscription, &block, *tx_index, &config, &cache, &conn, &rpc) {
+                    Ok(bns_entry) => {
+                        store_bns_entry(&conn, &bns_entry, &config.bns_history_mode);
+                        broadcast_message(&mut swarm, &BitmapMessage::BnsInscription(bns_entry.clone()));
+                        cache.update_bns(&bns_entry, current_block_height);
+                        info!("Processed BNS inscription: {}", bns_entry.name);
+                    },
+                    Err(reason) => {
+                        if config.network == "testnet" {
+                            warn!("Invalid BNS inscription '{}': {}", inscription.content, reason);
+                            if reason == "timestamp mismatch" {
+                                flag_for_review(&conn, &inscription, &reason, &block, *tx_index);
+                                if let Some(_resolved_ts) = resolve_timestamp_mismatch(&mut swarm, &inscription.id) {
+                                    // Placeholder: Retry validation with resolved timestamp
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+            tx.commit().unwrap();
+        });
+
+        current_block_height += 1;
+        std::thread::sleep(Duration::from_secs(10)); // Simulate block time
+    }
+}
