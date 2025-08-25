@@ -1,0 +1,16 @@
+[dependencies]
+# Existing ord dependencies
+bitcoin = "0.32.3"  # Updated from 0.30 for consistency
+ordinals = { git = "https://github.com/ordinals/ord", branch = "master" }
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.128"
+log = "0.4.22"
+# ... other existing ord dependencies (e.g., clap, redb)
+# Added for bitmap subcommand
+rusqlite = { version = "0.32.1", optional = true }
+serde_cbor = { version = "0.11.2", optional = true }
+reqwest = { version = "0.12.7", features = ["json"], optional = true }
+libp2p = { version = "0.53.2", features = ["tcp", "tokio", "gossipsub", "kad"], optional = true }
+
+[features]
+bitmap = ["rusqlite", "serde_cbor", "reqwest", "libp2p"]
